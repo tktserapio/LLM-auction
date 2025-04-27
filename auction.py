@@ -1,148 +1,144 @@
 import os
+import json
+import re
+import random
+import numpy as np
 from dotenv import load_dotenv
+
 import openai
 from openai import OpenAI
-import json
-import random
+# from azure.ai.inference import ChatCompletionsClient
+# from azure.ai.inference.models import SystemMessage
+# from azure.ai.inference.models import UserMessage
+# from azure.core.credentials import AzureKeyCredential
 
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
-NUM_BIDDERS = 3
-NUM_ROUNDS = 3
-VALUE_LOW, VALUE_HIGH = 0, 99 
-MODEL_NAME = "gpt-3.5-turbo"
-TEMPERATURE = 1.5
-MAX_TOKENS_PLAN = 200
-MAX_TOKENS_BID = 30
+NUM_ROUNDS      = 20
+VALUE_HIGH      = 99 # clip it to available capital
+AGENT_NAMES     = [
+    "WeatherBot1", "WeatherBot2",
+    "TrafficBot1", "TrafficBot2",
+    "MaintBot", "LocalEventsBot1", "RoadConditionBot1"
+]
+MAX_TOKENS_PLAN    = 200
+MAX_TOKENS_BID     = 30
 MAX_TOKENS_REFLECT = 120
+p_array = [0.58092181, 0.74994838, 0.53546851, 0.64430303, 0.47282165, 0.58420343,
+ 0.65763313, 0.73082427, 0.74466788, 0.63594236, 0.57868029, 0.59322022,
+ 0.69759318, 0.65834205, 0.58448011, 0.53830929, 0.62175658, 0.55001748,
+ 0.48609097, 0.71235304]
 
-BID_INCREMENT = 1
-
-AGENT_NAMES = ["Andy", "Betty", "Charles"]
-
-# just explaining the rules for first-price sealed-bid auction
-# modified from the the paper's Appendix A.3
 RULES_EXPLANATION = """
-In this game, you will participate in an auction for a prize against {num_bidders} other bidders.
-At the start of each round, bidders will see their value for the prize, randomly drawn between
-$0 and ${private}, with all values equally likely.
-
-After learning your value, you will submit a bid privately at the same time as the other bidders.
+In this game, you will participate in an auction to win the rights to implement a particular plan against {num_bidders} other bidders.
+At the start of each round, you will see a market signal and then propose a plan and bid for execution rights.
 Bids must be between $0 and ${private} in $1 increments.
-
-The highest bidder wins the prize and pays their bid amount. This means that if you win, we add
-to your earnings the value of the prize, and then subtract your own bid. If you do not win,
-your earnings remain unchanged for that round.
-
-After each auction, we will display all bids and the winner’s profits. Ties for the highest bid
-are resolved randomly.
-
-Before locking that bid in, consider if other bidders bid much lower than you—or much higher
-than you. Would you regret your bid?
+The winner pays the second-highest bid and earns the reward of their plan.
+Ties for the highest bid are broken uniformly at random.
 """
 
-# persona / user objective
 PERSONA_PROMPT = """
 Your TOP PRIORITY is to place bids which maximize your profit in the long run.
-To do this, you should explore different bidding strategies, including possibly risky or
-aggressive options for data-gathering purposes. Learn from the history of previous rounds
-in order to maximize your total profit. Remember that each round’s value is redrawn independently.
+You should learn from previous rounds to refine your strategy.
 """
 
-# kind of chain-of-thought-ish prompts for each step
+ACTION_PROMPT = """
+The market-implied probability that route A succeeds is {p:.2f}.
 
-# step 1: plan
-PLAN_PROMPT = """
-Write your plans for what bidding strategies to test next.
-Be detailed but keep it within 100 words.
-Try not to repeat yourself.
+You need to deliver a package.
+1) Propose your action plan to maximize the chance of delivery success.
+2) Estimate your value for this action plan being implemented. 
+
+Respond in JSON exactly like:
+{{"plan":"<your plan>", "value":<float>}}
 """
 
-# step 2: bid
 BID_INSTRUCTION = """
-Your value is {value}. Your plan is: {plan}
-FOLLOW YOUR PLAN. 
+Your value for implementing your plan is {value}.
 How much would you like to bid?
 Give your response with a single number and no other text, e.g. '36'.
 """
 
-# step 3: reflection
 REFLECT_PROMPT = """
-The previous round history is:
+The previous round summary was:
 {history}
-
-Do a counterfactual analysis. 
-Remember your goal is to win the bid and make higher profits.
-Limit your output to 100 words. 
-Start your reflection with:
-'If I bid down by .., I could...
- If I bid up by ..., I could...'
+Do a brief counterfactual:
+If I had bid lower, what might I have missed?
+If I had bid higher, what opportunity would I have gained?
 """
 
-
 def chat_completion(system_text, user_text, max_tokens=200):
-    """Utility function to call the OpenAI ChatCompletion API with given system & user text."""
-    response = openai.chat.completions.create(model=MODEL_NAME,
-    temperature=TEMPERATURE,
-    messages=[
-        {"role": "system", "content": system_text},
-        {"role": "user", "content": user_text},
-    ],
-    max_tokens=max_tokens)
-    return response.choices[0].message.content.strip()
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY")
+    )
+    
+    response = openai.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=1.0,
+        messages=[
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
+    )
 
+    # AZURE AI
+    # client = ChatCompletionsClient(
+    #     endpoint="https://models.github.ai/inference",
+    #     credential=AzureKeyCredential(os.environ["GITHUB_TOKEN"]),
+    # )
 
-# SIMULATE THE AUCTION BELOW
+    # response = client.complete(
+    #     messages=[
+    #         SystemMessage(system_text),
+    #         UserMessage(user_text),
+    #     ],
+    #     model="openai/gpt-4o-mini",
+    #     temperature=1.0,
+    #     max_tokens=4096,
+    #     top_p=0.1
+    # )
 
-def run_fpsb_auction():
-    agent_plans = {name: "" for name in AGENT_NAMES} # store agent plans
-    agent_reflections = {name: "" for name in AGENT_NAMES} # store agent reflections
-    round_history = []  # store round history
+    return response.choices[0].message.content
 
-    # for final analysis, we store a list of dicts: {round, agent, value, bid, is_winner, profit}
-    results_data = []
+def run_second_price_auction():
+    round_history = []
+    results = []
 
     for rnd in range(1, NUM_ROUNDS+1):
-        print(f"--- Starting Round {rnd} ---")
+        print(f"\n=== Round {rnd} ===")
+        public_hist = "\n".join(round_history)
 
-        # notes:
-        # 1. each agent sees full public history and their own reflections, 
-        # 2. maintain IPV --> agents don't see other agents' reflections directly. 
+        # 1) Prediction‐market phase
+        p = p_array[rnd-1]
+        print(f"Market P(success|route A) = {p:.2f}")
 
-        # build a summary of everything that happened so far:
-        # "Round 1: Andy bid 20, Betty bid 30, Charles bid 25. Winner was Betty at profit 70 - 30=40"
-        public_history_text = "\n".join(round_history)
+        # 2) Action proposals & expected‐value bids
+        agent_plans     = {}
+        agent_expected  = {}
+        agent_bids      = {}
 
         for name in AGENT_NAMES:
-            # user message for planning
-            system_base = f"You are Bidder {name}.\nYou are bidding against {', '.join(n for n in AGENT_NAMES if n!=name)}.\n"
-            system_base += RULES_EXPLANATION.format(num_bidders=NUM_BIDDERS-1, private=VALUE_HIGH)
-            system_base += PERSONA_PROMPT
+            # a) get plan + `reward` estimates
+            sys  = f"You are subagent {name}.\n" + RULES_EXPLANATION.format(num_bidders=len(AGENT_NAMES)-1, private=VALUE_HIGH)
+            sys += PERSONA_PROMPT
+            usr  = ACTION_PROMPT.format(p=p)
+            resp = chat_completion(sys, usr, max_tokens=MAX_TOKENS_PLAN)
 
-            user_plan_text = ""
-            user_plan_text += f"Here is the history so far:\n{public_history_text}\n\n"
-            user_plan_text += PLAN_PROMPT
+            info = json.loads(resp)
+            plan    = info["plan"]
 
-            plan_response = chat_completion(system_base, user_plan_text, max_tokens=MAX_TOKENS_PLAN)
-            agent_plans[name] = plan_response
-
+            # store
+            agent_plans[name]    = plan
+            agent_expected[name] = float(info["value"])
         
-        # random values and then prompt for a bid
-        agent_values = {}
-        agent_bids = {}
-        for name in AGENT_NAMES:
-            value = random.randint(VALUE_LOW, VALUE_HIGH)
-            agent_values[name] = value
-
-        
+        # get bids
         for name in AGENT_NAMES:
             # system text again with rules
             system_text = f"You are Bidder {name}.\nYou are bidding against {', '.join(n for n in AGENT_NAMES if n!=name)}.\n"
-            system_text += RULES_EXPLANATION.format(num_bidders=NUM_BIDDERS-1, private=VALUE_HIGH)
+            system_text += RULES_EXPLANATION.format(num_bidders=len(AGENT_NAMES)-1, private=VALUE_HIGH)
             system_text += PERSONA_PROMPT
 
-            user_text = BID_INSTRUCTION.format(value=agent_values[name], plan=agent_plans[name])
+            user_text = BID_INSTRUCTION.format(value=agent_expected[name])
             bid_str = chat_completion(system_text, user_text, max_tokens=MAX_TOKENS_BID)
 
             # parse the bid
@@ -161,80 +157,50 @@ def run_fpsb_auction():
             bid_final = round(bid_float)
             agent_bids[name] = bid_final
 
-        # winner determination
-        sorted_bidders = sorted(agent_bids.items(), key=lambda x: x[1], reverse=True)
-        top_bidder, top_bid = sorted_bidders[0]
-        
-        # tie breaking mechanism
-        winners = [top_bidder]
-        for i in range(1, len(sorted_bidders)):
-            if sorted_bidders[i][1] == top_bid:
-                winners.append(sorted_bidders[i][0])
-            else:
-                break
+        # 3) Determine winner & payment
+        sorted_bids = sorted(agent_bids.items(), key=lambda x: x[1], reverse=True)
+        top_name, top_bid = sorted_bids[0]
+        second_bid        = sorted_bids[1][1] if len(sorted_bids) > 1 else 0
 
-        if len(winners) > 1:
-            winner = random.choice(winners)
-        else:
-            winner = winners[0]
+        # tie‐break
+        top_ties = [n for n,b in sorted_bids if b == top_bid]
+        winner   = random.choice(top_ties) if len(top_ties)>1 else top_name
 
-        # ############ 4.4: Calculate Profits ############
-        winner_value = agent_values[winner]
-        # first-price sealed-bid => pay own bid
-        winner_profit = winner_value - agent_bids[winner]
-        # losers profit 0
-        # build a textual summary for the public history
-        round_summary = f"Round {rnd}:\n"
+        # 4) Compute profit
+        profit = agent_expected[winner] - second_bid
+
+        # 5) Summarize round
+        summary = f"Round {rnd} (p={p:.2f}):\n"
+        for n in AGENT_NAMES:
+            summary += f"  {n}: plan={agent_plans[n]!r}, bid={agent_bids[n]}\n"
+        summary += f"  WINNER: {winner}, pays {second_bid}, profit ≈ {profit:.2f}\n"
+        print(summary)
+
+        round_history.append(summary)
+
+        # 6) Reflections
         for name in AGENT_NAMES:
-            round_summary += f"  {name} value={agent_values[name]}, bid={agent_bids[name]}\n"
-        round_summary += f"  WINNER: {winner}, profit={winner_value}-{agent_bids[winner]}={winner_profit}\n"
-
-        round_history.append(round_summary)
-
-
-        # Let each agent see the final outcome. Then we store their reflection.
-        # This reflection is agent-specific and doesn't become public for others.
-        public_history_text_rnd = round_summary  # the result of this round only
-        for name in AGENT_NAMES:
-            system_text = f"You are Bidder {name}.\n"
-            system_text += f"You are bidding against {', '.join(n for n in AGENT_NAMES if n!=name)}.\n"
-            system_text += RULES_EXPLANATION.format(num_bidders=NUM_BIDDERS-1, private=VALUE_HIGH)
-            system_text += PERSONA_PROMPT
-
-            user_reflect = REFLECT_PROMPT.format(history=public_history_text_rnd)
-            reflection_response = chat_completion(system_text, user_reflect, max_tokens=MAX_TOKENS_REFLECT)
-            agent_reflections[name] = reflection_response
-            # We won't insert it into public history. Only the agent sees it.
-
-        # store history
-        for name in AGENT_NAMES:
-            is_winner = (name == winner)
-            profit = winner_profit if is_winner else 0
-            results_data.append({
+            sys = f"You are bidder {name}.\n" + RULES_EXPLANATION.format(num_bidders=len(AGENT_NAMES)-1, private=VALUE_HIGH)
+            sys += PERSONA_PROMPT
+            usr = REFLECT_PROMPT.format(history=summary)
+            refl = chat_completion(sys, usr, max_tokens=MAX_TOKENS_REFLECT)
+            results.append({
                 "round": rnd,
                 "agent": name,
-                "value": agent_values[name],
+                "market_p": p,
+                "plan": agent_plans[name],
+                "value": agent_expected[name],
                 "bid": agent_bids[name],
                 "winner": winner,
-                "profit": profit,
-                "plan": agent_plans[name],
-                "reflection": agent_reflections[name]
+                "paid": second_bid,
+                "profit": profit if name == winner else 0,
+                "reflection": refl
             })
 
-    # All rounds done
-    return results_data, round_history
-
+    return results, round_history
 
 if __name__ == "__main__":
-    # run the simulation
-    data, history = run_fpsb_auction()
-
-    # Save results to JSON or CSV:
-    with open("fpsb_results.json", "w", encoding="utf-8") as f:
+    data, history = run_second_price_auction()
+    with open("results/results.json", "w") as f:
         json.dump(data, f, indent=2)
-
-    # Print final round history
-    print("\n=== Auction Completed ===\n")
-    for h in history:
-        print(h)
-    print("\nResults stored in fpsb_results.json\n")
+    print("\nDone! Results written to results/results.json.")
