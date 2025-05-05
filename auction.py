@@ -11,6 +11,8 @@ from openai import OpenAI
 # from azure.ai.inference.models import SystemMessage
 # from azure.ai.inference.models import UserMessage
 # from azure.core.credentials import AzureKeyCredential
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -49,7 +51,7 @@ You need to deliver a package.
 1) Propose your action plan to maximize the chance of delivery success.
 2) Estimate your value for this action plan being implemented. 
 
-Respond in JSON exactly like:
+Use this JSON schema for your response:
 {{"plan":"<your plan>", "value":<float>}}
 """
 
@@ -68,6 +70,21 @@ If I had bid higher, what opportunity would I have gained?
 """
 
 def chat_completion(system_text, user_text, max_tokens=200):
+    
+    # Gemini API
+    # client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+    # response = client.models.generate_content(
+    #     model="gemini-2.0-flash",
+    #     config=types.GenerateContentConfig(
+    #         system_instruction=system_text, 
+    #         max_output_tokens=max_tokens,
+    #         temperature=1.0,
+    #         ),
+    #     contents=user_text
+    # )
+    
+    # OpenAI API
     client = OpenAI(
         api_key=os.getenv("OPENAI_API_KEY")
     )
@@ -97,8 +114,7 @@ def chat_completion(system_text, user_text, max_tokens=200):
     #     max_tokens=4096,
     #     top_p=0.1
     # )
-
-    return response.choices[0].message.content
+    return response.text
 
 def run_second_price_auction():
     round_history = []
@@ -123,7 +139,6 @@ def run_second_price_auction():
             sys += PERSONA_PROMPT
             usr  = ACTION_PROMPT.format(p=p)
             resp = chat_completion(sys, usr, max_tokens=MAX_TOKENS_PLAN)
-
             info = json.loads(resp)
             plan    = info["plan"]
 
